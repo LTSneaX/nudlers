@@ -97,10 +97,10 @@ const handler = createApiHandler({
         count: `COUNT(DISTINCT (t.identifier, t.vendor)) ${dir}, COALESCE(RIGHT(t.account_number, 4), 'Unknown') ASC`,
         transaction_count: `COUNT(DISTINCT (t.identifier, t.vendor)) ${dir}, COALESCE(RIGHT(t.account_number, 4), 'Unknown') ASC`,
         _default: `(
-          COALESCE(SUM(CASE WHEN t.category = 'Bank' AND t.price > 0 THEN t.price ELSE 0 END), 0) +
-          COALESCE(SUM(CASE WHEN t.category = 'Bank' AND t.price < 0 THEN ABS(t.price) ELSE 0 END), 0) +
+          COALESCE(SUM(CASE WHEN t.transaction_type = 'bank' AND t.price > 0 THEN t.price ELSE 0 END), 0) +
+          COALESCE(SUM(CASE WHEN t.transaction_type = 'bank' AND t.price < 0 THEN ABS(t.price) ELSE 0 END), 0) +
           COALESCE(SUM(
-            CASE WHEN COALESCE(t.category, 'Uncategorized') NOT IN ('Bank', 'Income') THEN ABS(t.price) ELSE 0 END
+            CASE WHEN t.transaction_type != 'bank' AND COALESCE(t.category, 'Uncategorized') NOT IN ('Income') THEN ABS(t.price) ELSE 0 END
           ), 0)
         ) ${dir}, COALESCE(RIGHT(t.account_number, 4), 'Unknown') ASC`,
       },
@@ -151,18 +151,18 @@ const handler = createApiHandler({
         SELECT 
           COALESCE(RIGHT(t.account_number, 4), 'Unknown') as last4digits,
           COUNT(DISTINCT (t.identifier, t.vendor)) as transaction_count,
-          COALESCE(SUM(CASE WHEN t.category = 'Bank' AND t.price > 0 THEN t.price ELSE 0 END), 0)::numeric as bank_income,
-          COALESCE(SUM(CASE WHEN t.category = 'Bank' AND t.price < 0 THEN ABS(t.price) ELSE 0 END), 0)::numeric as bank_expenses,
+          COALESCE(SUM(CASE WHEN t.transaction_type = 'bank' AND t.price > 0 THEN t.price ELSE 0 END), 0)::numeric as bank_income,
+          COALESCE(SUM(CASE WHEN t.transaction_type = 'bank' AND t.price < 0 THEN ABS(t.price) ELSE 0 END), 0)::numeric as bank_expenses,
           COALESCE(SUM(
-            CASE WHEN COALESCE(t.category, 'Uncategorized') NOT IN ('Bank', 'Income') THEN ABS(t.price) ELSE 0 END
+            CASE WHEN t.transaction_type != 'bank' AND COALESCE(t.category, 'Uncategorized') NOT IN ('Income') THEN ABS(t.price) ELSE 0 END
           ), 0)::numeric as card_expenses,
           COALESCE(SUM(CASE WHEN t.price > 0 THEN t.price ELSE 0 END), 0)::numeric as total_income,
           COALESCE(SUM(CASE WHEN t.price < 0 THEN ABS(t.price) ELSE 0 END), 0)::numeric as total_outflow,
           (
-            COALESCE(SUM(CASE WHEN t.category = 'Bank' AND t.price > 0 THEN t.price ELSE 0 END), 0) -
-            COALESCE(SUM(CASE WHEN t.category = 'Bank' AND t.price < 0 THEN ABS(t.price) ELSE 0 END), 0) -
+            COALESCE(SUM(CASE WHEN t.transaction_type = 'bank' AND t.price > 0 THEN t.price ELSE 0 END), 0) -
+            COALESCE(SUM(CASE WHEN t.transaction_type = 'bank' AND t.price < 0 THEN ABS(t.price) ELSE 0 END), 0) -
             COALESCE(SUM(
-              CASE WHEN COALESCE(t.category, 'Uncategorized') NOT IN ('Bank', 'Income') THEN ABS(t.price) ELSE 0 END
+              CASE WHEN t.transaction_type != 'bank' AND COALESCE(t.category, 'Uncategorized') NOT IN ('Income') THEN ABS(t.price) ELSE 0 END
             ), 0)
           )::numeric as net_balance,
           COALESCE(ba.id, vc.id) as bank_account_id,
@@ -190,10 +190,10 @@ const handler = createApiHandler({
             TO_CHAR(t.date, 'YYYY-MM') as month,
             t.vendor,
             vc.nickname as vendor_nickname,
-            COALESCE(SUM(CASE WHEN t.category = 'Bank' AND t.price > 0 THEN t.price ELSE 0 END), 0) as bank_income,
-            COALESCE(SUM(CASE WHEN t.category = 'Bank' AND t.price < 0 THEN ABS(t.price) ELSE 0 END), 0) as bank_expenses,
+            COALESCE(SUM(CASE WHEN t.transaction_type = 'bank' AND t.price > 0 THEN t.price ELSE 0 END), 0) as bank_income,
+            COALESCE(SUM(CASE WHEN t.transaction_type = 'bank' AND t.price < 0 THEN ABS(t.price) ELSE 0 END), 0) as bank_expenses,
             COALESCE(SUM(
-              CASE WHEN COALESCE(t.category, 'Uncategorized') NOT IN ('Bank', 'Income') THEN ABS(t.price) ELSE 0 END
+              CASE WHEN t.transaction_type != 'bank' AND COALESCE(t.category, 'Uncategorized') NOT IN ('Income') THEN ABS(t.price) ELSE 0 END
             ), 0) as card_expenses
           FROM transactions t
           ${credentialJoin}
