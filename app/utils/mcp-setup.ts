@@ -53,6 +53,148 @@ function formatCurrency(amount: number): string {
     }).format(amount);
 }
 
+// ============================================================================
+// Vault + sync stream helpers (used by vault/sync MCP tools)
+// ============================================================================
+
+// Vault status shape returned by GET /vault/status
+interface VaultStatus {
+    locked: boolean;
+    initialized: boolean;
+    needsMigration: boolean;
+    hasPasskeys: boolean;
+    passkeysCount: number;
+}
+
+// Fetch vault status without throwing on a non-2xx (caller decides).
+async function fetchVaultStatus(): Promise<VaultStatus | null> {
+    const response = await fetch(`${API_BASE}/vault/status`, {
+        headers: { "Content-Type": "application/json" },
+    });
+    if (!response.ok) return null;
+    return (await response.json()) as VaultStatus;
+}
+
+// Attempt to unlock the vault with a passphrase. Returns true on success.
+// NEVER logs or returns the passphrase value — only success/failure.
+async function unlockVaultWithPassphrase(
+    passphrase: string
+): Promise<boolean> {
+    try {
+        const response = await fetch(`${API_BASE}/vault/unlock`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ passphrase }),
+        });
+        if (!response.ok) return false;
+        const data = (await response.json()) as { success?: boolean };
+        return data?.success === true;
+    } catch {
+        return false;
+    }
+}
+
+// Read the passphrase from the arg or env var. Returns undefined if neither.
+function resolvePassphrase(arg?: string): string | undefined {
+    if (arg) return arg;
+    return process.env.NUDLERS_VAULT_PASSPHRASE;
+}
+
+// SSE event accumulator used by the trigger_sync tool. Data lines are single
+// line JSON, so each `data:` line is parsed independently.
+interface SyncEventRecord {
+    event: string;
+    data: any;
+}
+
+function parseSseEvent(event: string, rawData: string): SyncEventRecord | null {
+    if (!rawData) return null;
+    try {
+        return { event, data: JSON.parse(rawData) };
+    } catch {
+        return null;
+    }
+}
+
+// Thin typed interface for the reader options (avoids coupling the helper to
+// call-site argument types).
+interface SyncEventReaderOptions {
+    daysBack: number;
+    timeoutMs?: number;
+}
+
+// Runs a POST request against the sync-all-stream SSE endpoint and iterates
+// each parsed event in order. The response body is consumed fully (or aborted
+// after the caller-provided timeout). Returns ok:false with an error string if
+// the request could not be established or the stream was aborted.
+async function readSyncStream(
+    options: SyncEventReaderOptions,
+    onEvent: (record: SyncEventRecord) => void
+): Promise<{ ok: boolean; error?: string }> {
+    const timeoutMs = options.timeoutMs ?? 120000;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+        const response = await fetch(`${API_BASE}/scrapers/sync-all-stream`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ daysBack: options.daysBack }),
+            signal: controller.signal,
+        });
+        if (!response.ok) {
+            const errorText = await response.text();
+            return { ok: false, error: `Sync failed: ${response.status} - ${errorText}` };
+        }
+
+        const reader = response.body?.getReader();
+        if (!reader) {
+            return { ok: false, error: "No response stream available" };
+        }
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let currentEvent = "message";
+
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            // Split buffered content into lines; keep the last partial line.
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
+
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (trimmed === "") {
+                    // Event terminator — emit the accumulated event.
+                    currentEvent = "message";
+                    continue;
+                }
+                if (trimmed.startsWith("event:")) {
+                    currentEvent = trimmed.slice("event:".length).trim();
+                    continue;
+                }
+                if (trimmed.startsWith("data:")) {
+                    const raw = trimmed.slice("data:".length).trim();
+                    const record = parseSseEvent(currentEvent, raw);
+                    if (record) onEvent(record);
+                }
+            }
+        }
+        return { ok: true };
+    } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+            return { ok: false, error: "AbortError" };
+        }
+        return { ok: false, error: String(error) };
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
 export function createMcpServer() {
     const server = new McpServer({
         name: "nudlers",
@@ -840,6 +982,322 @@ export function createMcpServer() {
             } catch (error) {
                 return {
                     content: [{ type: "text", text: `Error fetching balance projection: ${error}` }],
+                };
+            }
+        }
+    );
+
+    // ============================================================================
+    // TOOL: Get Vault Status
+    // ============================================================================
+    server.registerTool(
+        "get_vault_status",
+        {
+            description: "Get the vault status: whether it is locked/unlocked, initialized, needs migration, and whether passkeys are enrolled.",
+        },
+        async () => {
+            try {
+                const status = await apiRequest<VaultStatus>("/vault/status");
+
+                if (!status) {
+                    return {
+                        content: [{ type: "text", text: "Unable to fetch vault status." }],
+                    };
+                }
+
+                const initialized = status.initialized ? "yes" : "no";
+                const passkey = status.hasPasskeys ? `yes (${status.passkeysCount})` : "no";
+                const migration = status.needsMigration ? " | needs migration" : "";
+
+                let summary: string;
+                if (status.locked) {
+                    summary = `Vault: 🔒 LOCKED (initialized: ${initialized} | passphrase: ${initialized} | passkey: ${passkey})${migration}`;
+                } else {
+                    summary = `Vault: ✅ unlocked (initialized: ${initialized} | passphrase: ${initialized} | passkey: ${passkey})${migration}`;
+                }
+
+                return {
+                    content: [{ type: "text", text: summary }],
+                };
+            } catch (error) {
+                return {
+                    content: [{ type: "text", text: `Error fetching vault status: ${error}` }],
+                };
+            }
+        }
+    );
+
+    // ============================================================================
+    // TOOL: Unlock Vault
+    // ============================================================================
+    server.registerTool(
+        "unlock_vault",
+        {
+            description: "Unlock the vault using a passphrase (either provided as an argument or read from NUDLERS_VAULT_PASSPHRASE). Never echoes the passphrase.",
+            inputSchema: {
+                passphrase: z
+                    .string()
+                    .optional()
+                    .describe("The vault passphrase. If not provided, NUDLERS_VAULT_PASSPHRASE is used."),
+            },
+        },
+        async ({ passphrase }) => {
+            const resolved = resolvePassphrase(passphrase);
+            if (!resolved) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: "No passphrase available. Pass a passphrase arg or set NUDLERS_VAULT_PASSPHRASE env var.",
+                        },
+                    ],
+                };
+            }
+
+            try {
+                // apiRequest throws on non-2xx; the unlock endpoint returns 401 on a bad
+                // passphrase. We detect that and surface a friendly message.
+                await apiRequest<{ success?: boolean }>("/vault/unlock", {
+                    method: "POST",
+                    body: JSON.stringify({ passphrase: resolved }),
+                });
+                return {
+                    content: [{ type: "text", text: "Vault unlocked ✅" }],
+                };
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : String(error);
+                if (msg.includes("401")) {
+                    return {
+                        content: [{ type: "text", text: "Unlock failed: Invalid passphrase" }],
+                    };
+                }
+                return {
+                    content: [{ type: "text", text: `Unlock failed: ${msg}` }],
+                };
+            }
+        }
+    );
+
+    // ============================================================================
+    // TOOL: Trigger Sync
+    // ============================================================================
+    server.registerTool(
+        "trigger_sync",
+        {
+            description: "Trigger a full synchronization of all bank accounts and credit cards. Streams progress and returns a per-account summary.",
+            inputSchema: {
+                daysBack: z
+                    .number()
+                    .int()
+                    .positive()
+                    .optional()
+                    .default(30)
+                    .describe("How many days of transactions to scrape. Defaults to 30."),
+            },
+        },
+        async ({ daysBack = 30 }) => {
+            const startedAt = Date.now();
+
+            // Vault pre-check: if locked, try to unlock with env passphrase.
+            let vaultStatus: VaultStatus | null = null;
+            try {
+                vaultStatus = await fetchVaultStatus();
+            } catch {
+                vaultStatus = null;
+            }
+
+            if (vaultStatus && vaultStatus.locked) {
+                const passphrase = resolvePassphrase(undefined);
+                if (!passphrase) {
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: "Vault is locked and no passphrase available. Set NUDLERS_VAULT_PASSPHRASE env var or unlock via the nudlers dashboard.",
+                            },
+                        ],
+                    };
+                }
+                const unlocked = await unlockVaultWithPassphrase(passphrase);
+                if (!unlocked) {
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: "Vault is locked and unlock failed. Unlock via the nudlers dashboard or set NUDLERS_VAULT_PASSPHRASE env var.",
+                            },
+                        ],
+                    };
+                }
+            }
+
+            // Accumulated state from the SSE stream.
+            const accountsById = new Map<string, any>();
+            let totalAccounts = 0;
+            let completeEvent: any = null;
+            let errorEvent: any = null;
+
+            const result = await readSyncStream(
+                { daysBack, timeoutMs: 120000 },
+                (record) => {
+                    switch (record.event) {
+                        case "queue": {
+                            const accounts = record.data?.accounts;
+                            if (Array.isArray(accounts)) {
+                                totalAccounts = accounts.length;
+                                for (const acc of accounts) {
+                                    accountsById.set(acc.id, {
+                                        id: acc.id,
+                                        nickname: acc.nickname || acc.vendor || "Unknown",
+                                    });
+                                }
+                            }
+                            break;
+                        }
+                        case "account_start": {
+                            const d = record.data || {};
+                            if (!accountsById.has(d.id)) {
+                                accountsById.set(d.id, {
+                                    id: d.id,
+                                    nickname: d.nickname || "Unknown",
+                                });
+                            }
+                            break;
+                        }
+                        case "account_complete": {
+                            const d = record.data || {};
+                            accountsById.set(d.id, {
+                                id: d.id,
+                                nickname:
+                                    (accountsById.get(d.id)?.nickname) ||
+                                    d.nickname ||
+                                    "Unknown",
+                                savedTransactions: d.summary?.savedTransactions ?? 0,
+                            });
+                            break;
+                        }
+                        case "account_error": {
+                            const d = record.data || {};
+                            accountsById.set(d.id, {
+                                id: d.id,
+                                nickname:
+                                    (accountsById.get(d.id)?.nickname) ||
+                                    d.nickname ||
+                                    "Unknown",
+                                error: d.message || "Unknown error",
+                            });
+                            break;
+                        }
+                        case "complete":
+                            completeEvent = record.data || {};
+                            break;
+                        case "error":
+                            errorEvent = record.data || {};
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            );
+
+            // A terminal `error` SSE event stops the sync immediately.
+            if (errorEvent) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Sync failed: ${errorEvent.message || "Unknown error"}`,
+                        },
+                    ],
+                };
+            }
+
+            if (!result.ok && result.error === "AbortError") {
+                // Partial summary — accounts that started but did not complete.
+                const lines: string[] = [
+                    `🔄 Sync triggered for ${totalAccounts} accounts (daysBack: ${daysBack})`,
+                    "",
+                ];
+                for (const acc of accountsById.values()) {
+                    if (acc.savedTransactions != null) {
+                        lines.push(`✅ ${acc.nickname} — ${acc.savedTransactions} new transactions`);
+                    } else if (acc.error) {
+                        lines.push(`❌ ${acc.nickname} — error: ${acc.error}`);
+                    } else {
+                        lines.push(`⏳ ${acc.nickname} — still running...`);
+                    }
+                }
+                lines.push("");
+                lines.push("⏱️ Sync still running (120s timeout). Check get_sync_status for updates.");
+                return {
+                    content: [{ type: "text", text: lines.join("\n") }],
+                };
+            }
+
+            if (!result.ok) {
+                return {
+                    content: [{ type: "text", text: result.error || "Sync failed" }],
+                };
+            }
+
+            // Build the complete summary.
+            const lines: string[] = [
+                `🔄 Sync triggered for ${totalAccounts} accounts (daysBack: ${daysBack})`,
+                "",
+            ];
+            for (const acc of accountsById.values()) {
+                if (acc.savedTransactions != null) {
+                    lines.push(`✅ ${acc.nickname} — ${acc.savedTransactions} new transactions`);
+                } else if (acc.error) {
+                    lines.push(`❌ ${acc.nickname} — error: ${acc.error}`);
+                } else {
+                    lines.push(`⏳ ${acc.nickname} — still running...`);
+                }
+            }
+
+            const duration =
+                completeEvent?.summary?.durationSeconds ??
+                Math.round((Date.now() - startedAt) / 1000);
+            lines.push("");
+            lines.push(`✅ Sync complete in ${duration}s`);
+
+            return {
+                content: [{ type: "text", text: lines.join("\n") }],
+            };
+        }
+    );
+
+    // ============================================================================
+    // TOOL: Stop Sync
+    // ============================================================================
+    server.registerTool(
+        "stop_sync",
+        {
+            description: "Stop any running scrapers and kill their browser processes.",
+        },
+        async () => {
+            try {
+                const data = await apiRequest<{ success?: boolean; message?: string }>(
+                    "/scrapers/stop",
+                    { method: "POST" }
+                );
+
+                if (data?.success) {
+                    return {
+                        content: [{ type: "text", text: "🛑 All scrapers stopped" }],
+                    };
+                }
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Error stopping scrapers: ${data?.message || "Unknown error"}`,
+                        },
+                    ],
+                };
+            } catch (error) {
+                return {
+                    content: [{ type: "text", text: `Error stopping scrapers: ${error}` }],
                 };
             }
         }
