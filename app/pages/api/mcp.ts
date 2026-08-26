@@ -28,6 +28,44 @@ function readRawBody(req: any): Promise<string> {
     });
 }
 
+// Patch the request's Accept header to include both content types the MCP
+// Streamable HTTP transport requires (application/json AND text/event-stream).
+// opencode's MCP client only sends `Accept: application/json`, which the SDK
+// rejects with a 406 ("Not Acceptable"). We must patch BOTH representations of
+// the header:
+//   1. `req.headers`  — Node's parsed key/value object.
+//   2. `req.rawHeaders` — Node's flat `[key, value, key, value]` array.
+// Hono's node-server adapter (`newHeadersFromIncoming`) builds the Web `Request`
+// headers from `incoming.rawHeaders`, NOT from the parsed `incoming.headers`
+// object. The SDK's Accept check reads off that Web Request, so patching only
+// `req.headers` never reaches the check (still 406). Mutating the raw array in
+// place guarantees the fix propagates through Hono to the SDK.
+function patchAcceptHeader(req: any): void {
+    const acceptHeader = (req.headers?.["accept"] || "") as string;
+    if (acceptHeader.includes("text/event-stream")) {
+        return; // already acceptable
+    }
+
+    // Mutate the parsed headers object (harmless, kept for consistency).
+    req.headers["accept"] = "application/json, text/event-stream";
+
+    // Mutate the flat rawHeaders array that Hono actually reads.
+    const raw = req.rawHeaders as string[] | undefined;
+    if (Array.isArray(raw)) {
+        let found = false;
+        for (let i = 0; i + 1 < raw.length; i += 2) {
+            if (raw[i].toLowerCase() === "accept") {
+                raw[i + 1] = "application/json, text/event-stream";
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            raw.push("accept", "application/json, text/event-stream");
+        }
+    }
+}
+
 export default async function handler(req: any, res: any) {
     let transport: StreamableHTTPServerTransport | undefined;
     try {
@@ -71,10 +109,7 @@ export default async function handler(req: any, res: any) {
         // Workaround: opencode's MCP client sends Accept: application/json only,
         // but the Streamable HTTP transport requires both application/json and
         // text/event-stream (per MCP spec). Patch the header before handing off.
-        const acceptHeader = req.headers["accept"] || "";
-        if (!acceptHeader.includes("text/event-stream")) {
-            req.headers["accept"] = "application/json, text/event-stream";
-        }
+        patchAcceptHeader(req);
 
         await transport.handleRequest(req, res, parsedBody);
     } catch (error: any) {
