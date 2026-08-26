@@ -68,6 +68,14 @@ export default async function handler(req: any, res: any) {
             }
         }
 
+        // Workaround: opencode's MCP client sends Accept: application/json only,
+        // but the Streamable HTTP transport requires both application/json and
+        // text/event-stream (per MCP spec). Patch the header before handing off.
+        const acceptHeader = req.headers["accept"] || "";
+        if (!acceptHeader.includes("text/event-stream")) {
+            req.headers["accept"] = "application/json, text/event-stream";
+        }
+
         await transport.handleRequest(req, res, parsedBody);
     } catch (error: any) {
         logger.error({ error: error?.message, stack: error?.stack }, "MCP handler error");
