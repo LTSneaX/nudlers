@@ -39,7 +39,7 @@ export default async function handler(req, res) {
                 FROM transactions t
                 WHERE t.transaction_type = 'bank'
                   AND t.date >= CURRENT_DATE - INTERVAL '180 days'
-                  AND t.category NOT IN ('Bank', 'Income')
+                  AND COALESCE(t.category, 'Uncategorized') NOT IN ('Bank', 'Income')
                   AND NOT EXISTS (
                       SELECT 1 FROM excluded e 
                       WHERE LOWER(TRIM(t.name)) = e.name 
