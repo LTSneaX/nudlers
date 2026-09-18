@@ -19,8 +19,6 @@ services:
       POSTGRES_DB: ${NUDLERS_DB_NAME:-nudlers}
       POSTGRES_USER: ${NUDLERS_DB_USER:-myuser}
       POSTGRES_PASSWORD: ${NUDLERS_DB_PASSWORD:?NUDLERS_DB_PASSWORD is required}
-    ports:
-      - "5432:5432"
     volumes:
       - db-data:/var/lib/postgresql/data
     command: postgres -c ssl=off
@@ -33,7 +31,7 @@ services:
       retries: 5
 
   nudlers-app:
-    image: ghcr.io/enudler/nudlers:latest
+    build: ./app
     restart: unless-stopped
     # Note: No 'user:' needed - container starts as root to fix volume permissions,
     # then automatically drops to non-root 'pptruser' via gosu
@@ -43,15 +41,21 @@ services:
       - NUDLERS_DB_NAME=${NUDLERS_DB_NAME:-nudlers}
       - NUDLERS_DB_PASSWORD=${NUDLERS_DB_PASSWORD:?NUDLERS_DB_PASSWORD is required}
       - NUDLERS_DB_PORT=5432
+      - NUDLERS_API_URL=http://localhost:3000/api
       # Legacy encryption key (pass through for vault migration)
       - NUDLERS_ENCRYPTION_KEY=${NUDLERS_ENCRYPTION_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      # Resource mode: normal | low (defaults to low for NAS)
-      - RESOURCE_MODE=${RESOURCE_MODE:-low}
-      # Legacy support (RESOURCE_MODE takes precedence if set)
-      - LOW_RESOURCES_MODE=true
+      - AI_BASE_URL=${AI_BASE_URL:-}
+      - AI_API_KEY=${AI_API_KEY:-}
+      - AI_MODEL=${AI_MODEL:-}
+      - PASSKEY_ENCRYPTION_SECRET=${PASSKEY_ENCRYPTION_SECRET:-}
+      - NUDLERS_VAULT_PASSPHRASE=${NUDLERS_VAULT_PASSPHRASE:-}
+      - WEBAUTHN_RP_ID=${WEBAUTHN_RP_ID:-localhost}
+      - WEBAUTHN_ORIGIN=${WEBAUTHN_ORIGIN:-http://localhost:6969}
+      # Resource mode: normal | low (defaults to normal)
+      - RESOURCE_MODE=${RESOURCE_MODE:-normal}
     ports:
-      - "3000:3000"
+      - "100.64.55.1:8001:3000"
     depends_on:
       nudlers-db:
         condition: service_healthy
@@ -62,7 +66,7 @@ services:
     security_opt:
       - seccomp=unconfined
     # Reduced from 2gb - with --single-process and aggressive flags, 512mb is sufficient
-    shm_size: '512mb'
+    shm_size: '2gb'
     dns:
       - 8.8.8.8
       - 8.8.4.4
@@ -74,7 +78,7 @@ services:
         reservations:
           memory: 512M
     volumes:
-      - whatsapp-data:/app/.wwebjs_auth
+      - whatsapp-data:/app/.baileys_auth
 
 volumes:
   db-data:
